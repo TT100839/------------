@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "わりと使えるメモ",
+  "version": "1.0.0",
+  "description": "多機能で軽量なタブ型メモ拡張機能です。タブや検索機能やショートカットを使ってアイデアやメモを簡単に管理できます。",
+  "permissions": ["storage", "tabs", "unlimitedStorage"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

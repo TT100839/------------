@@ -1,0 +1,714 @@
+const isWindowMode = new URLSearchParams(window.location.search).has("mode");
+const els = {
+  memoArea: document.getElementById("memo-area"),
+  tabContainer: document.getElementById("tab-container"),
+  linksArea: document.getElementById("links-area"),
+  addTabBtn: document.getElementById("add-tab-btn"),
+  removeTabBtn: document.getElementById("remove-tab-btn"),
+  timeBtn: document.getElementById("time-btn"),
+  urlBtn: document.getElementById("url-btn"),
+  modeSwitchBtn: document.getElementById("mode-switch-btn"),
+  undoBtn: document.getElementById("undo-btn"),
+  redoBtn: document.getElementById("redo-btn"),
+  exportBtn: document.getElementById("export-btn"),
+  header: document.getElementById("header"),
+  charCount: document.getElementById("char-count"),
+  searchBtn: document.getElementById("search-btn"),
+  searchContainer: document.getElementById("search-container"),
+  searchInput: document.getElementById("search-input"),
+  searchNextBtn: document.getElementById("search-next-btn"),
+  searchPrevBtn: document.getElementById("search-prev-btn"),
+  searchCloseBtn: document.getElementById("search-close-btn"),
+  backdrop: document.getElementById("backdrop"),
+  contextMenu: document.getElementById("tab-context-menu"),
+  menuDuplicate: document.getElementById("menu-duplicate-tab"),
+  menuAddRight: document.getElementById("menu-add-tab-right"),
+  menuRemove: document.getElementById("menu-remove-tab"),
+};
+
+const state = {
+  tabs: [],
+  activeTabId: null,
+  history: [],
+  redo: [],
+  deleted: [],
+  searchIdx: -1,
+  timer: null,
+  dragging: false,
+  startX: 0,
+  startY: 0,
+  mWidth: "500px",
+  mHeight: "300px",
+  wWidth: 420,
+  wHeight: 550,
+  contextTargetId: null,
+  targetTabId: null,
+};
+
+function init() {
+  els.memoArea.placeholder = "";
+
+  chrome.storage.local.get(
+    [
+      "tabs",
+      "activeTabId",
+      "memoWidth",
+      "memoHeight",
+      "windowWidth",
+      "windowHeight",
+    ],
+    (res) => {
+      state.tabs = res.tabs?.length ? res.tabs : [{ id: Date.now(), text: "" }];
+      Object.assign(state, {
+        activeTabId: res.activeTabId || state.activeTabId,
+        wWidth: res.windowWidth || state.wWidth,
+        wHeight: res.windowHeight || state.wHeight,
+        mWidth: res.memoWidth || state.mWidth,
+        mHeight: res.memoHeight || state.mHeight,
+      });
+
+      applyModeLayout();
+
+      if (!state.tabs.some((t) => t.id === state.activeTabId)) {
+        state.activeTabId = state.tabs[0].id;
+      }
+      switchTab(state.activeTabId);
+      updateUndoRedo();
+    },
+  );
+}
+
+function applyModeLayout() {
+  if (isWindowMode) {
+    els.modeSwitchBtn.style.display = "none";
+    els.memoArea.style.resize = "none";
+    document.body.style.width = "100%";
+    document.body.style.height = "100vh";
+    els.memoArea.style.maxWidth = "none";
+
+    const container = document.getElementById("memo-container");
+    container.style.display = "flex";
+    container.style.flexDirection = "column";
+    container.style.flexGrow = "1";
+
+    els.memoArea.style.flexGrow = "1";
+    els.memoArea.style.height = "auto";
+    els.memoArea.style.maxHeight = "none";
+    els.tabContainer.parentElement.style.width = "100%";
+  } else {
+    els.modeSwitchBtn.style.display = "flex";
+
+    els.memoArea.style.width = state.mWidth;
+    els.memoArea.style.height = state.mHeight;
+    els.memoArea.style.maxHeight = "480px";
+    els.tabContainer.parentElement.style.width = els.memoArea.style.width;
+  }
+}
+
+function saveToStorage() {
+  chrome.storage.local.set({
+    tabs: state.tabs,
+    activeTabId: state.activeTabId,
+    memoWidth: state.mWidth,
+    memoHeight: state.mHeight,
+    windowWidth: state.wWidth,
+    windowHeight: state.wHeight,
+  });
+}
+
+function updateUI() {
+  updateLinks();
+  updateCharCount();
+  saveToStorage();
+}
+
+function updateLinks() {
+  els.linksArea.innerHTML = "";
+  const urls = els.memoArea.value.match(/https?:\/\/[^\s)]+/g) || [];
+
+  if (!urls.length) {
+    els.linksArea.style.display = "none";
+    return;
+  }
+
+  els.linksArea.style.display = "flex";
+  const label = document.createElement("div");
+  label.className = "links-label";
+  label.textContent = "links";
+  els.linksArea.appendChild(label);
+
+  urls.forEach((url) => {
+    const a = document.createElement("a");
+    Object.assign(a, { href: url, target: "_blank", title: url });
+
+    let displayStr = url;
+    try {
+      displayStr = new URL(url).hostname;
+    } catch (e) {}
+
+    a.innerHTML = `
+      <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" class="link-icon">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+      </svg>
+      <span class="link-text"></span>
+    `;
+    a.querySelector(".link-text").textContent = displayStr;
+    els.linksArea.appendChild(a);
+  });
+}
+
+function updateCharCount() {
+  els.charCount.textContent = `${els.memoArea.value.length}文字`;
+}
+
+function renderTabs() {
+  els.tabContainer.innerHTML = "";
+
+  state.tabs.forEach((tab, i) => {
+    const btn = document.createElement("button");
+    Object.assign(btn, {
+      textContent: i + 1,
+      title: `Tab ${i + 1}`,
+    });
+
+    if (tab.id === state.activeTabId) btn.classList.add("active");
+    btn.onclick = () => switchTab(tab.id);
+    btn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      state.contextTargetId = tab.id;
+      els.contextMenu.style.left = `${e.clientX}px`;
+      els.contextMenu.style.top = `${e.clientY}px`;
+      els.contextMenu.style.display = "block";
+    });
+    els.tabContainer.appendChild(btn);
+  });
+
+  els.removeTabBtn.style.display =
+    state.tabs.length > 1 ? "inline-block" : "none";
+}
+
+function switchTab(id, isAuto = false) {
+  if (!isAuto && state.activeTabId !== id && state.activeTabId !== null) {
+    state.targetTabId = state.activeTabId;
+  }
+
+  state.activeTabId = id;
+  const t = state.tabs.find((t) => t.id === id);
+  els.memoArea.value = t ? t.text : "";
+
+  renderTabs();
+  updateUI();
+  if (els.backdrop) els.backdrop.innerHTML = "";
+}
+
+function addTab() {
+  insertTabAt(state.tabs.length);
+}
+
+function removeCurrentTab() {
+  removeTabById(state.activeTabId);
+}
+
+function insertTabAt(index, text = "") {
+  pushSnapshot();
+  const id = Date.now();
+  state.tabs.splice(index, 0, { id, text });
+  switchTab(id);
+}
+function duplicateCurrentTab() {
+  const idx = state.tabs.findIndex((t) => t.id === state.activeTabId);
+  if (idx === -1) return;
+  insertTabAt(idx + 1, state.tabs[idx].text);
+}
+
+function removeTabById(id) {
+  if (state.tabs.length <= 1) return;
+  pushSnapshot();
+
+  const idx = state.tabs.findIndex((t) => t.id === id);
+  if (idx === -1) return;
+  let nextId = state.activeTabId;
+
+  if (state.activeTabId === id) {
+    let closeDir = "right";
+    if (state.targetTabId) {
+      const targetIdx = state.tabs.findIndex((t) => t.id === state.targetTabId);
+      if (targetIdx !== -1) {
+        closeDir = targetIdx < idx ? "left" : "right";
+      } else {
+        state.targetTabId = null;
+      }
+    } else if (idx === state.tabs.length - 1) {
+      closeDir = "left";
+    }
+
+    if (closeDir === "left") {
+      nextId = state.tabs[idx > 0 ? idx - 1 : idx + 1].id;
+    } else {
+      nextId = state.tabs[idx < state.tabs.length - 1 ? idx + 1 : idx - 1].id;
+    }
+    if (nextId === state.targetTabId) {
+      state.targetTabId = null;
+    }
+  }
+
+  const btn = els.tabContainer.children[idx];
+  if (btn) {
+    btn.style.width = `${btn.offsetWidth}px`;
+    btn.offsetHeight;
+    btn.classList.add("removing");
+
+    setTimeout(() => {
+      executeRemove(id, nextId);
+    }, 20);
+  } else {
+    executeRemove(id, nextId);
+  }
+}
+
+function executeRemove(id, nextId) {
+  const idx = state.tabs.findIndex((t) => t.id === id);
+  if (idx !== -1) {
+    state.deleted.push({ origIdx: idx, data: state.tabs[idx] });
+    state.tabs.splice(idx, 1);
+  }
+
+  if (state.targetTabId === id) {
+    state.targetTabId = null;
+  }
+
+  if (state.activeTabId === id) {
+    switchTab(nextId, true);
+  } else {
+    renderTabs();
+    updateUI();
+  }
+}
+
+function getSnapshot() {
+  return {
+    tabs: structuredClone(state.tabs),
+    activeTabId: state.activeTabId,
+  };
+}
+
+function pushSnapshot() {
+  state.history.push(getSnapshot());
+  if (state.history.length > 100) state.history.shift();
+  state.redo = [];
+  updateUndoRedo();
+}
+
+function handleHistory(isUndo) {
+  const source = isUndo ? state.history : state.redo;
+  const target = isUndo ? state.redo : state.history;
+  if (!source.length) return;
+  target.push(getSnapshot());
+  restoreState(source.pop());
+}
+
+function undoAction() {
+  if (!state.history.length) return;
+  state.redo.push(getSnapshot());
+  restoreState(state.history.pop());
+}
+
+function redoAction() {
+  if (!state.redo.length) return;
+  state.history.push(getSnapshot());
+  restoreState(state.redo.pop());
+}
+
+function restoreState(s) {
+  state.tabs = s.tabs;
+  state.activeTabId = s.activeTabId;
+  els.memoArea.value =
+    state.tabs.find((t) => t.id === state.activeTabId)?.text || "";
+
+  renderTabs();
+  updateUI();
+  updateUndoRedo();
+}
+
+function undoRemove() {
+  if (!state.deleted.length) return;
+  pushSnapshot();
+  const last = state.deleted.pop();
+  state.tabs.splice(Math.min(last.origIdx, state.tabs.length), 0, last.data);
+  switchTab(last.data.id);
+}
+
+function updateUndoRedo() {
+  els.undoBtn.disabled = !state.history.length;
+  els.redoBtn.disabled = !state.redo.length;
+}
+
+function insertText(text) {
+  pushSnapshot();
+  const t = state.tabs.find((t) => t.id === state.activeTabId);
+  if (!t) return;
+
+  const { selectionStart: start, selectionEnd: end, value: val } = els.memoArea;
+  els.memoArea.value = val.slice(0, start) + text + val.slice(end);
+  els.memoArea.setSelectionRange(start + text.length, start + text.length);
+  els.memoArea.focus();
+
+  t.text = els.memoArea.value;
+  updateUI();
+}
+
+function insertTime() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  insertText(
+    `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
+  );
+}
+
+function insertUrl() {
+  chrome.windows.getLastFocused({ windowTypes: ["normal"] }, (win) => {
+    if (win)
+      chrome.tabs.query({ active: true, windowId: win.id }, (tabs) => {
+        if (tabs?.length) insertText(`[${tabs[0].title}]\n${tabs[0].url}\n`);
+      });
+  });
+}
+
+function exportMemo() {
+  const text = els.memoArea.value;
+  if (!text) return;
+
+  const name =
+    text
+      .split("\n")[0]
+      .trim()
+      .replace(/[\\/:*?"<>|]/g, "")
+      .slice(0, 30) || "memo";
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  const a = document.createElement("a");
+
+  Object.assign(a, { href: url, download: `${name}.txt` }).click();
+  URL.revokeObjectURL(url);
+}
+
+function openInWindow() {
+  chrome.windows.create({
+    url: chrome.runtime.getURL("popup.html") + "?mode=window",
+    type: "popup",
+    width: state.wWidth,
+    height: state.wHeight,
+  });
+  window.close();
+}
+
+function toggleSearchUI() {
+  const isHidden =
+    els.searchContainer.style.display === "none" ||
+    !els.searchContainer.style.display;
+  els.searchContainer.style.display = isHidden ? "flex" : "none";
+
+  if (isHidden) {
+    els.searchInput.focus();
+  } else {
+    if (els.backdrop) els.backdrop.innerHTML = "";
+    els.memoArea.focus();
+  }
+}
+
+function performGlobalSearch(dir = "next") {
+  const query = els.searchInput.value.toLowerCase();
+  if (!query) return els.backdrop && (els.backdrop.innerHTML = "");
+
+  const curIdx = state.tabs.findIndex((t) => t.id === state.activeTabId);
+
+  for (let i = 0; i <= state.tabs.length; i++) {
+    const tIdx =
+      dir === "next"
+        ? (curIdx + i) % state.tabs.length
+        : (curIdx - i + state.tabs.length) % state.tabs.length;
+        
+    // 【修正】改行コードを \n に完全正規化して文字数のズレを防止
+    const rawText = state.tabs[tIdx].text.replace(/\r\n/g, '\n');
+    const text = rawText.toLowerCase();
+
+    let start =
+      i === 0
+        ? dir === "next"
+          ? state.searchIdx + 1
+          : state.searchIdx - 1
+        : dir === "next"
+          ? 0
+          : text.length;
+    if (i === 0 && dir !== "next" && state.searchIdx === -1)
+      start = text.length;
+
+    const found =
+      dir === "next"
+        ? text.indexOf(query, start)
+        : text.lastIndexOf(query, start);
+
+    if (found !== -1) {
+      if (i !== 0) switchTab(state.tabs[tIdx].id);
+
+      setTimeout(() => {
+        // 正規化済みの rawText を渡す
+        applyHighlight(rawText, found, query.length);
+        els.memoArea.setSelectionRange(found, found + query.length);
+        state.searchIdx = found;
+        els.searchInput.focus();
+        
+        const mark = els.backdrop?.querySelector("mark");
+        if (mark) {
+          const scrollTo = Math.max(0, mark.offsetTop - 40);
+          els.memoArea.scrollTop = scrollTo;
+          els.backdrop.scrollTop = scrollTo; 
+        }
+      }, 10);
+      return;
+    }
+  }
+}
+
+function applyHighlight(text, idx, len) {
+  if (!els.backdrop) return;
+  const esc = (s) => s.replace(/[&<>"']/g, (m) => {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return map[m];
+  });
+  
+  els.backdrop.innerHTML = `${esc(text.slice(0, idx))}<mark>${esc(text.slice(idx, idx + len))}</mark>${esc(text.slice(idx + len))}<br>`;
+  
+  syncBackdrop();
+  els.backdrop.scrollTop = els.memoArea.scrollTop;
+}
+
+function syncBackdrop() {
+  if (!els.backdrop) return;
+  const s = window.getComputedStyle(els.memoArea);
+  Object.assign(els.backdrop.style, {
+    top: `${els.memoArea.offsetTop + (parseFloat(s.borderTopWidth) || 0)}px`,
+    left: `${els.memoArea.offsetLeft + (parseFloat(s.borderLeftWidth) || 0)}px`,
+    width: `${els.memoArea.clientWidth}px`,
+    height: `${els.memoArea.clientHeight}px`,
+    padding: s.padding,
+    fontFamily: s.fontFamily,
+    fontSize: s.fontSize,
+    lineHeight: s.lineHeight,
+    letterSpacing: s.letterSpacing,
+    wordSpacing: s.wordSpacing,
+    textIndent: s.textIndent
+  });
+}
+els.addTabBtn.onclick = addTab;
+els.removeTabBtn.onclick = removeCurrentTab;
+els.timeBtn.onclick = insertTime;
+els.urlBtn.onclick = insertUrl;
+els.modeSwitchBtn.onclick = openInWindow;
+[els.searchBtn, els.searchCloseBtn].forEach(
+  (btn) => (btn.onclick = toggleSearchUI),
+);
+els.undoBtn.onclick = () => handleHistory(true);
+els.redoBtn.onclick = () => handleHistory(false);
+els.exportBtn.onclick = exportMemo;
+els.searchBtn.onclick = toggleSearchUI;
+els.searchCloseBtn.onclick = toggleSearchUI;
+els.searchPrevBtn.onclick = () => performGlobalSearch("prev");
+els.searchNextBtn.onclick = () => performGlobalSearch("next");
+
+els.menuDuplicate.onclick = () => {
+  const idx = state.tabs.findIndex((t) => t.id === state.contextTargetId);
+  if (idx === -1) return;
+  insertTabAt(idx + 1, state.tabs[idx].text);
+};
+
+els.menuAddRight.onclick = () => {
+  const idx = state.tabs.findIndex((t) => t.id === state.contextTargetId);
+  if (idx === -1) return;
+  insertTabAt(idx + 1, "");
+};
+els.menuRemove.onclick = () => {
+  removeTabById(state.contextTargetId);
+};
+
+els.memoArea.addEventListener("input", () => {
+  updateCharCount();
+  if (els.backdrop) els.backdrop.innerHTML = "";
+
+  if (!state.timer) pushSnapshot();
+  clearTimeout(state.timer);
+
+  const t = state.tabs.find((t) => t.id === state.activeTabId);
+  if (t) {
+    t.text = els.memoArea.value;
+    updateUI();
+  }
+
+  state.timer = setTimeout(() => (state.timer = null), 500);
+});
+
+els.memoArea.addEventListener(
+  "scroll",
+  () => els.backdrop && (els.backdrop.scrollTop = els.memoArea.scrollTop),
+);
+
+els.searchInput.addEventListener("input", () => (state.searchIdx = -1));
+els.searchInput.addEventListener("keydown", (e) => {
+  if ((e.code === "Enter" && !e.shiftKey) || e.code === "ArrowDown") {
+    e.preventDefault();
+    performGlobalSearch("next");
+  } else if ((e.code === "Enter" && e.shiftKey) || e.code === "ArrowUp") {
+    e.preventDefault();
+    performGlobalSearch("prev");
+  }
+});
+
+document.addEventListener("click", () => {
+  if (els.contextMenu) els.contextMenu.style.display = "none";
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Escape") {
+    if (els.searchContainer.style.display === "flex") {
+      e.preventDefault();
+      toggleSearchUI();
+    }
+    return;
+  }
+  const isCmdOrCtrl = e.ctrlKey || e.metaKey;
+  if (!isCmdOrCtrl || e.altKey) return;
+
+  const c = e.code;
+
+  if (c === "KeyZ") {
+    e.preventDefault();
+    handleHistory(!e.shiftKey);
+  } else if (c === "KeyY" && !e.shiftKey) {
+    e.preventDefault();
+    handleHistory(false);
+  } else if (c === "KeyT" || c === "KeyN") {
+    e.preventDefault();
+    e.shiftKey ? undoRemove() : addTab();
+  } else if (c === "KeyW" && !e.shiftKey) {
+    e.preventDefault();
+    removeCurrentTab();
+  } else if (c === "KeyP" && !e.shiftKey) {
+    e.preventDefault();
+    isWindowMode ? window.close() : openInWindow();
+  } else if ((c === "KeyH" || c === "KeyF") && !e.shiftKey) {
+    e.preventDefault();
+    const selectedText = els.memoArea.value.substring(els.memoArea.selectionStart, els.memoArea.selectionEnd);
+    if (selectedText) {
+      els.searchInput.value = selectedText;
+      state.searchIdx = els.memoArea.selectionStart - 1;
+      if (els.searchContainer.style.display !== "flex") {
+        els.searchContainer.style.display = "flex";
+      }
+      els.searchInput.focus();
+      performGlobalSearch("next");
+    } else {
+      toggleSearchUI();
+    }
+  } else if (c === "Tab" && !e.shiftKey && state.tabs.length > 1) {
+    e.preventDefault();
+    switchTab(
+      state.tabs[
+        (state.tabs.findIndex((t) => t.id === state.activeTabId) + 1) %
+          state.tabs.length
+      ].id,
+    );
+  } else if (c === "KeyE" && e.shiftKey) {
+    e.preventDefault();
+    exportMemo();
+  } else if (c === "KeyS" && !e.shiftKey) {
+    e.preventDefault();
+    exportMemo();
+  } else if (c === "KeyD") {
+    e.preventDefault();
+    insertUrl();
+  } else if (c === "KeyK" && e.shiftKey) {
+    e.preventDefault();
+    duplicateCurrentTab();
+  }else if (c === "KeyL" && e.shiftKey) {
+    e.preventDefault();
+    insertTime();
+  }else if (c.startsWith("Digit") && c !== "Digit0") {
+    const tabIndex = parseInt(c.replace("Digit", ""), 10) - 1;
+    if (state.tabs[tabIndex]) {
+      e.preventDefault();
+      switchTab(state.tabs[tabIndex].id);
+    }
+  }
+});
+
+els.header.style.cursor = "grab";
+els.header.addEventListener("mousedown", (e) => {
+  if (isWindowMode || e.target.tagName === "BUTTON") return;
+  state.dragging = true;
+  state.startX = e.clientX;
+  state.startY = e.clientY;
+});
+document.addEventListener("mousemove", (e) => {
+  if (!state.dragging) return;
+  if (
+    Math.abs(e.clientX - state.startX) > 5 ||
+    Math.abs(e.clientY - state.startY) > 5
+  ) {
+    state.dragging = false;
+    openInWindow();
+  }
+});
+document.addEventListener("mouseup", () => (state.dragging = false));
+
+if (isWindowMode) {
+  let rt;
+  window.addEventListener("resize", () => {
+    clearTimeout(rt);
+    rt = setTimeout(() => {
+      state.wWidth = window.outerWidth;
+      state.wHeight = window.outerHeight;
+      saveToStorage();
+    }, 500);
+  });
+} else {
+  const ro = new ResizeObserver((entries) => {
+    window.requestAnimationFrame(() => {
+      if (!entries?.length) return;
+      const w = Math.max(260, els.memoArea.offsetWidth + 20);
+      const h = Math.max(150, els.memoArea.offsetHeight + 100);
+
+      document.documentElement.style.width = `${w}px`;
+      document.documentElement.style.height = `${h}px`;
+      document.body.style.width = "auto";
+      document.body.style.height = "auto";
+      document.body.style.minWidth = `${w}px`;
+      document.body.style.minHeight = `${h}px`;
+    });
+    els.tabContainer.parentElement.style.width = `${els.memoArea.offsetWidth}px`;
+  });
+
+  ro.observe(els.memoArea);
+  els.memoArea.addEventListener("mouseup", () => {
+    if (
+      state.mWidth !== els.memoArea.style.width ||
+      state.mHeight !== els.memoArea.style.height
+    ) {
+      state.mWidth = els.memoArea.style.width;
+      state.mHeight = els.memoArea.style.height;
+      saveToStorage();
+    }
+  });
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const btnAddTab = document.getElementById('btn-demo-add-tab');
+  const btnSearch = document.getElementById('btn-demo-search');
+
+  if (btnAddTab) {
+    btnAddTab.addEventListener('click', () => playDemo('addTab'));
+  }
+  if (btnSearch) {
+    btnSearch.addEventListener('click', () => playDemo('search'));
+  }
+});
+
+init();
