@@ -3,10 +3,12 @@ const els = {
   memoArea: document.getElementById("memo-area"),
   tabContainer: document.getElementById("tab-container"),
   linksArea: document.getElementById("links-area"),
+  filesArea: document.getElementById("files-area"),
   addTabBtn: document.getElementById("add-tab-btn"),
   removeTabBtn: document.getElementById("remove-tab-btn"),
   timeBtn: document.getElementById("time-btn"),
   urlBtn: document.getElementById("url-btn"),
+  fileBtn: document.getElementById("file-btn"),
   modeSwitchBtn: document.getElementById("mode-switch-btn"),
   undoBtn: document.getElementById("undo-btn"),
   redoBtn: document.getElementById("redo-btn"),
@@ -44,10 +46,41 @@ const state = {
   contextTargetId: null,
   targetTabId: null,
 };
+let db;
+const initDB = () => {
+  const req = indexedDB.open("MemoFilesDB", 1);
+  req.onupgradeneeded = (e) => {
+    db = e.target.result;
+    if (!db.objectStoreNames.contains("files")) {
+      db.createObjectStore("files");
+    }
+  };
+  req.onsuccess = (e) => {
+    db = e.target.result;
+    updateFiles();
+  };
+};
+function getUniqueFileTag(fileName) {
+  let nameWithoutExt = fileName;
+  let ext = "";
+  const lastDotIdx = fileName.lastIndexOf('.');
+  if (lastDotIdx > 0) {
+    nameWithoutExt = fileName.substring(0, lastDotIdx);
+    ext = fileName.substring(lastDotIdx);
+  }
 
+  let tag = `[${fileName}]`;
+  let counter = 1;
+  const allText = state.tabs.map((t) => t.text).join("");
+  while (allText.includes(tag)) {
+    tag = `[${nameWithoutExt} (${counter})${ext}]`;
+    counter++;
+  }
+  return tag;
+}
 function init() {
+  initDB();
   els.memoArea.placeholder = "";
-
   chrome.storage.local.get(
     [
       "tabs",
@@ -76,6 +109,17 @@ function init() {
       updateUndoRedo();
     },
   );
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.tabs) {
+      state.tabs = changes.tabs.newValue || [];
+      const currentTab = state.tabs.find((t) => t.id === state.activeTabId);
+      if (currentTab && els.memoArea.value !== currentTab.text) {
+        els.memoArea.value = currentTab.text;
+        updateVisuals();
+      }
+      renderTabs();
+    }
+  });
 }
 
 function applyModeLayout() {
@@ -116,9 +160,14 @@ function saveToStorage() {
   });
 }
 
-function updateUI() {
+function updateVisuals() {
   updateLinks();
   updateCharCount();
+  updateFiles();
+}
+
+function updateUI() {
+  updateVisuals();
   saveToStorage();
 }
 
@@ -157,7 +206,59 @@ function updateLinks() {
     els.linksArea.appendChild(a);
   });
 }
+function updateFiles() {
+  if (!els.filesArea || !db) return;
 
+  const tx = db.transaction("files", "readonly");
+  const req = tx.objectStore("files").getAllKeys();
+
+  req.onsuccess = () => {
+    els.filesArea.innerHTML = "";
+    const keys = req.result; // DBに保存された "[ファイル名.pdf]" などの配列
+    const currentText = els.memoArea.value;
+
+    // 現在のテキスト内に存在するファイルタグのみを抽出
+    const activeFiles = keys.filter(key => currentText.includes(key));
+
+    if (!activeFiles.length) {
+      els.filesArea.style.display = "none";
+      return;
+    }
+
+    els.filesArea.style.display = "flex";
+    const label = document.createElement("div");
+    label.className = "files-label";
+    label.textContent = "files";
+    els.filesArea.appendChild(label);
+
+    activeFiles.forEach((fileTag) => {
+      // 画面表示用には前後の [ ] を取り除く
+      const displayStr = fileTag.slice(1, -1);
+
+      const btn = document.createElement("button");
+      btn.className = "file-link";
+      btn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" class="link-icon">
+          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+          <polyline points="13 2 13 9 20 9"></polyline>
+        </svg>
+        <span class="link-text">${displayStr}</span>
+      `;
+
+      btn.onclick = () => {
+        const getReq = db.transaction("files", "readonly").objectStore("files").get(fileTag);
+        getReq.onsuccess = () => {
+          if (getReq.result) {
+            const url = URL.createObjectURL(getReq.result);
+            window.open(url, "_blank");
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+          }
+        };
+      };
+      els.filesArea.appendChild(btn);
+    });
+  };
+}
 function updateCharCount() {
   els.charCount.textContent = `${els.memoArea.value.length}文字`;
 }
@@ -169,11 +270,10 @@ function renderTabs() {
     const btn = document.createElement("button");
     Object.assign(btn, {
       textContent: i + 1,
-      title: `Tab ${i + 1}`,
+      title: `Tab ${i + 1}`
     });
-
     if (tab.id === state.activeTabId) btn.classList.add("active");
-    btn.onclick = () => switchTab(tab.id);
+    
     btn.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       state.contextTargetId = tab.id;
@@ -181,6 +281,85 @@ function renderTabs() {
       els.contextMenu.style.top = `${e.clientY}px`;
       els.contextMenu.style.display = "block";
     });
+
+    // ブラウザタブ風の滑らかなドラッグ＆ドロップ処理
+    btn.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      
+      let dragged = false;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let placeholder = null;
+
+      const onPointerMove = (moveEvent) => {
+        // 一定距離動かしたらドラッグ開始と判定する
+        if (!dragged) {
+          if (Math.abs(moveEvent.clientX - startX) > 3 || Math.abs(moveEvent.clientY - startY) > 3) {
+            dragged = true;
+            const rect = btn.getBoundingClientRect();
+            
+            placeholder = document.createElement("button");
+            placeholder.style.width = `${rect.width}px`;
+            placeholder.style.height = `${rect.height}px`;
+            placeholder.style.opacity = "0";
+            placeholder.style.margin = "0";
+            els.tabContainer.insertBefore(placeholder, btn);
+            
+            btn.classList.add("tab-dragging");
+            btn.style.width = `${rect.width}px`;
+            btn.style.height = `${rect.height}px`;
+            document.body.appendChild(btn);
+          }
+        }
+
+        if (dragged) {
+          // カーソル位置に合わせてタブを移動
+          btn.style.left = `${moveEvent.clientX - btn.offsetWidth / 2}px`;
+          btn.style.top = `${moveEvent.clientY - btn.offsetHeight / 2}px`;
+
+          // 背面にある要素を特定してプレースホルダーを挿入（視覚的な入れ替え）
+          const elements = document.elementsFromPoint(moveEvent.clientX, moveEvent.clientY);
+          const targetTab = elements.find(el => el.parentElement === els.tabContainer && el !== placeholder);
+          
+          if (targetTab) {
+            const targetRect = targetTab.getBoundingClientRect();
+            if (moveEvent.clientX > targetRect.left + targetRect.width / 2) {
+              els.tabContainer.insertBefore(placeholder, targetTab.nextSibling);
+            } else {
+              els.tabContainer.insertBefore(placeholder, targetTab);
+            }
+          }
+        }
+      };
+
+      const onPointerUp = () => {
+        document.removeEventListener("pointermove", onPointerMove);
+        document.removeEventListener("pointerup", onPointerUp);
+        
+        if (dragged) {
+          if (placeholder) {
+            pushSnapshot();
+            // ドロップ位置に応じてデータの配列を更新
+            const children = Array.from(els.tabContainer.children);
+            const newIndex = children.indexOf(placeholder);
+            const [movedTab] = state.tabs.splice(i, 1);
+            state.tabs.splice(newIndex, 0, movedTab);
+            placeholder.remove(); // 不要になったプレースホルダーを削除
+          }
+          btn.remove(); // bodyに取り残されたドラッグ用のボタンを削除
+          
+          saveToStorage();
+          renderTabs();
+        } else {
+          // ドラッグされなかった場合は通常のタブ切り替えとして処理
+          switchTab(tab.id);
+        }
+      };
+
+      document.addEventListener("pointermove", onPointerMove);
+      document.addEventListener("pointerup", onPointerUp);
+    });
+
     els.tabContainer.appendChild(btn);
   });
 
@@ -427,9 +606,9 @@ function performGlobalSearch(dir = "next") {
       dir === "next"
         ? (curIdx + i) % state.tabs.length
         : (curIdx - i + state.tabs.length) % state.tabs.length;
-        
+
     // 【修正】改行コードを \n に完全正規化して文字数のズレを防止
-    const rawText = state.tabs[tIdx].text.replace(/\r\n/g, '\n');
+    const rawText = state.tabs[tIdx].text.replace(/\r\n/g, "\n");
     const text = rawText.toLowerCase();
 
     let start =
@@ -457,12 +636,12 @@ function performGlobalSearch(dir = "next") {
         els.memoArea.setSelectionRange(found, found + query.length);
         state.searchIdx = found;
         els.searchInput.focus();
-        
+
         const mark = els.backdrop?.querySelector("mark");
         if (mark) {
           const scrollTo = Math.max(0, mark.offsetTop - 40);
           els.memoArea.scrollTop = scrollTo;
-          els.backdrop.scrollTop = scrollTo; 
+          els.backdrop.scrollTop = scrollTo;
         }
       }, 10);
       return;
@@ -472,13 +651,20 @@ function performGlobalSearch(dir = "next") {
 
 function applyHighlight(text, idx, len) {
   if (!els.backdrop) return;
-  const esc = (s) => s.replace(/[&<>"']/g, (m) => {
-    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-    return map[m];
-  });
-  
+  const esc = (s) =>
+    s.replace(/[&<>"']/g, (m) => {
+      const map = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+      return map[m];
+    });
+
   els.backdrop.innerHTML = `${esc(text.slice(0, idx))}<mark>${esc(text.slice(idx, idx + len))}</mark>${esc(text.slice(idx + len))}<br>`;
-  
+
   syncBackdrop();
   els.backdrop.scrollTop = els.memoArea.scrollTop;
 }
@@ -497,7 +683,7 @@ function syncBackdrop() {
     lineHeight: s.lineHeight,
     letterSpacing: s.letterSpacing,
     wordSpacing: s.wordSpacing,
-    textIndent: s.textIndent
+    textIndent: s.textIndent,
   });
 }
 els.addTabBtn.onclick = addTab;
@@ -530,7 +716,17 @@ els.menuAddRight.onclick = () => {
 els.menuRemove.onclick = () => {
   removeTabById(state.contextTargetId);
 };
-
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  if (!db || !e.dataTransfer.files.length) return;
+  for (const file of e.dataTransfer.files) {
+    const fileTag = getUniqueFileTag(file.name);
+    const tx = db.transaction("files", "readwrite");
+    tx.objectStore("files").put(file, fileTag);
+    insertText(fileTag + "\n");
+  }
+});
 els.memoArea.addEventListener("input", () => {
   updateCharCount();
   if (els.backdrop) els.backdrop.innerHTML = "";
@@ -543,7 +739,6 @@ els.memoArea.addEventListener("input", () => {
     t.text = els.memoArea.value;
     updateUI();
   }
-
   state.timer = setTimeout(() => (state.timer = null), 500);
 });
 
@@ -597,7 +792,10 @@ document.addEventListener("keydown", (e) => {
     isWindowMode ? window.close() : openInWindow();
   } else if ((c === "KeyH" || c === "KeyF") && !e.shiftKey) {
     e.preventDefault();
-    const selectedText = els.memoArea.value.substring(els.memoArea.selectionStart, els.memoArea.selectionEnd);
+    const selectedText = els.memoArea.value.substring(
+      els.memoArea.selectionStart,
+      els.memoArea.selectionEnd,
+    );
     if (selectedText) {
       els.searchInput.value = selectedText;
       state.searchIdx = els.memoArea.selectionStart - 1;
@@ -629,10 +827,10 @@ document.addEventListener("keydown", (e) => {
   } else if (c === "KeyK" && e.shiftKey) {
     e.preventDefault();
     duplicateCurrentTab();
-  }else if (c === "KeyL" && e.shiftKey) {
+  } else if (c === "KeyL" && e.shiftKey) {
     e.preventDefault();
     insertTime();
-  }else if (c.startsWith("Digit") && c !== "Digit0") {
+  } else if (c.startsWith("Digit") && c !== "Digit0") {
     const tabIndex = parseInt(c.replace("Digit", ""), 10) - 1;
     if (state.tabs[tabIndex]) {
       e.preventDefault();
@@ -668,6 +866,7 @@ if (isWindowMode) {
       state.wWidth = window.outerWidth;
       state.wHeight = window.outerHeight;
       saveToStorage();
+      syncBackdrop();
     }, 500);
   });
 } else {
@@ -683,6 +882,7 @@ if (isWindowMode) {
       document.body.style.height = "auto";
       document.body.style.minWidth = `${w}px`;
       document.body.style.minHeight = `${h}px`;
+      syncBackdrop();
     });
     els.tabContainer.parentElement.style.width = `${els.memoArea.offsetWidth}px`;
   });
@@ -699,16 +899,48 @@ if (isWindowMode) {
     }
   });
 }
-document.addEventListener('DOMContentLoaded', () => {
-  const btnAddTab = document.getElementById('btn-demo-add-tab');
-  const btnSearch = document.getElementById('btn-demo-search');
+document.addEventListener("DOMContentLoaded", () => {
+  const btnAddTab = document.getElementById("btn-demo-add-tab");
+  const btnSearch = document.getElementById("btn-demo-search");
 
   if (btnAddTab) {
-    btnAddTab.addEventListener('click', () => playDemo('addTab'));
+    btnAddTab.addEventListener("click", () => playDemo("addTab"));
   }
   if (btnSearch) {
-    btnSearch.addEventListener('click', () => playDemo('search'));
+    btnSearch.addEventListener("click", () => playDemo("search"));
   }
 });
+els.fileBtn.onclick = () => {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.onchange = () => {
+    if (!db || !input.files.length) return;
+    for (const file of input.files) {
+      const fileTag = getUniqueFileTag(file.name);
+      const tx = db.transaction("files", "readwrite");
+      tx.objectStore("files").put(file, fileTag);
+      insertText(fileTag + "\n");
+    }
+  };
+  input.click();
+};
 
+// 拡張機能（ポップアップ画面）が閉じられたときに不要ファイルを一括削除する処理
+window.addEventListener("pagehide", () => {
+  if (db) {
+    const tx = db.transaction("files", "readonly");
+    const req = tx.objectStore("files").getAllKeys();
+    req.onsuccess = () => {
+      const keys = req.result;
+      const allText = state.tabs.map((tab) => tab.text).join("");
+      keys.forEach((key) => {
+        if (!allText.includes(key)) {
+          const deleteTx = db.transaction("files", "readwrite");
+          deleteTx.objectStore("files").delete(key);
+        }
+      });
+    };
+  }
+});
 init();

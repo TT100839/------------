@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "わりと使えるメモ",
+  "name": "test",
   "version": "1.0.0",
   "description": "多機能で軽量なタブ型メモ拡張機能です。タブや検索機能やショートカットを使ってアイデアやメモを簡単に管理できます。",
   "permissions": ["storage", "tabs", "unlimitedStorage"],
